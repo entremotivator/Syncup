@@ -1,347 +1,312 @@
 import streamlit as st
 import requests
-import datetime
-import pandas as pd
-import plotly.express as px
-from typing import List, Dict, Optional
+from typing import Optional, Dict, List
 from utils.wordpress_auth import supabase, wp_config
 
-@st.cache_data(ttl=600, show_spinner=False)
-def get_wc_customer_orders(wp_user_id: int) -> List[Dict]:
-    """Get WooCommerce orders for a WordPress customer"""
+def get_user_purchased_products(email: str) -> List[Dict]:
+    """Get products purchased by user email"""
     if not wp_config:
-        st.error("WordPress configuration not available")
         return []
-
-    # First, get the WooCommerce customer ID from WordPress user ID
-    customer_id = get_wc_customer_id_from_wp_user(wp_user_id)
-    if not customer_id:
-        st.info("No WooCommerce customer found for this WordPress user")
-        return []
-
-    url = f"{wp_config['wp_url']}/wp-json/wc/v3/orders"
-    params = {
-        "customer": customer_id,
-        "per_page": 100,
-        "orderby": "date",
-        "order": "desc"
-    }
 
     try:
-        resp = requests.get(
-            url,
+        # First, find customer by email
+        customers_url = f"{wp_config['wp_url']}/wp-json/wc/v3/customers"
+        customers_resp = requests.get(
+            customers_url,
             auth=(wp_config['wc_key'], wp_config['wc_secret']),
-            params=params,
-            timeout=15
-        )
-
-        if resp.status_code == 200:
-            orders = resp.json()
-            
-            # Enrich order data and sync to Supabase
-            enriched_orders = []
-            for order in orders:
-                enriched_order = enrich_order_data(order)
-                enriched_orders.append(enriched_order)
-                sync_order_to_supabase(enriched_order, wp_user_id)
-            
-            return enriched_orders
-        else:
-            st.error(f"WooCommerce API error: {resp.status_code} - {resp.text}")
-            return []
-
-    except requests.exceptions.RequestException as e:
-        st.error(f"Failed to fetch WooCommerce orders: {e}")
-        return []
-
-def get_wc_customer_id_from_wp_user(wp_user_id: int) -> Optional[int]:
-    """Get WooCommerce customer ID from WordPress user ID"""
-    if not wp_config:
-        return None
-
-    url = f"{wp_config['wp_url']}/wp-json/wc/v3/customers"
-    params = {
-        "search": str(wp_user_id),
-        "per_page": 1
-    }
-
-    try:
-        resp = requests.get(
-            url,
-            auth=(wp_config['wc_key'], wp_config['wc_secret']),
-            params=params,
+            params={"email": email, "per_page": 1},
             timeout=10
         )
 
-        if resp.status_code == 200:
-            customers = resp.json()
-            if customers:
-                return customers[0]['id']
+        if customers_resp.status_code != 200 or not customers_resp.json():
+            return []
+
+        customer = customers_resp.json()[0]
+        customer_id = customer['id']
+
+        # Get customer orders
+        orders_url = f"{wp_config['wp_url']}/wp-json/wc/v3/orders"
+        orders_resp = requests.get(
+            orders_url,
+            auth=(wp_config['wc_key'], wp_config['wc_secret']),
+            params={
+                "customer": customer_id,
+                "status": "completed",
+                "per_page": 100
+            },
+            timeout=15
+        )
+
+        if orders_resp.status_code != 200:
+            return []
+
+        orders = orders_resp.json()
         
-        # If not found by search, try to get by email from WordPress user
-        wp_user = get_wp_user_by_id(wp_user_id)
-        if wp_user and wp_user.get('email'):
-            return get_wc_customer_by_email(wp_user['email'])
-            
-        return None
+        # Extract unique products from completed orders
+        purchased_products = []
+        product_ids = set()
+        
+        for order in orders:
+            for item in order.get('line_items', []):
+                product_id = item.get('product_id')
+                if product_id and product_id not in product_ids:
+                    product_ids.add(product_id)
+                    purchased_products.append({
+                        'product_id': product_id,
+                        'name': item.get('name'),
+                        'quantity': item.get('quantity', 1),
+                        'total': item.get('total', '0'),
+                        'order_id': order.get('id'),
+                        'order_date': order.get('date_created')
+                    })
+
+        return purchased_products
 
     except Exception as e:
-        st.warning(f"Could not get WooCommerce customer ID: {e}")
-        return None
+        st.error(f"Error fetching purchased products: {e}")
+        return []
 
-def get_wp_user_by_id(wp_user_id: int) -> Optional[Dict]:
-    """Get WordPress user by ID"""
+def check_product_access(email: str, required_product_ids: List[int] = None) -> bool:
+    """Check if user has purchased required products for access"""
+    purchased_products = get_user_purchased_products(email)
+    
+    if not purchased_products:
+        return False
+    
+    # If no specific products required, any purchase grants access
+    if not required_product_ids:
+        return True
+    
+    # Check if user has purchased any of the required products
+    purchased_ids = [p['product_id'] for p in purchased_products]
+    return any(pid in purchased_ids for pid in required_product_ids)
+
+def get_wc_product_details(product_id: int) -> Optional[Dict]:
+    """Get WooCommerce product details"""
     if not wp_config:
         return None
 
-    url = f"{wp_config['wp_url']}/wp-json/wp/v2/users/{wp_user_id}"
-    
     try:
-        resp = requests.get(url, timeout=10)
+        product_url = f"{wp_config['wp_url']}/wp-json/wc/v3/products/{product_id}"
+        resp = requests.get(
+            product_url,
+            auth=(wp_config['wc_key'], wp_config['wc_secret']),
+            timeout=10
+        )
+
         if resp.status_code == 200:
             return resp.json()
         return None
-    except:
+
+    except Exception as e:
+        st.warning(f"Could not fetch product details: {e}")
         return None
 
-def get_wc_customer_by_email(email: str) -> Optional[int]:
-    """Get WooCommerce customer ID by email"""
+def woo_product_login(email: str, password: str) -> Optional[Dict]:
+    """Login using WooCommerce product purchases + WordPress auth"""
     if not wp_config:
+        st.error("WordPress configuration not available")
         return None
 
-    url = f"{wp_config['wp_url']}/wp-json/wc/v3/customers"
-    params = {
-        "email": email,
-        "per_page": 1
-    }
-
+    # First authenticate with WordPress
+    wp_url = f"{wp_config['wp_url']}/wp-json/jwt-auth/v1/token"
+    
     try:
-        resp = requests.get(
-            url,
-            auth=(wp_config['wc_key'], wp_config['wc_secret']),
-            params=params,
+        # Try WordPress authentication first
+        wp_resp = requests.post(
+            wp_url,
+            data={"username": email, "password": password},
             timeout=10
         )
 
-        if resp.status_code == 200:
-            customers = resp.json()
-            return customers[0]['id'] if customers else None
-        return None
-
-    except Exception as e:
-        st.warning(f"Could not get customer by email: {e}")
-        return None
-
-def enrich_order_data(order: Dict) -> Dict:
-    """Enrich order data with calculated fields"""
-    order['total_float'] = float(order.get('total', 0))
-    order['subtotal_float'] = float(order.get('subtotal', 0))
-    order['tax_total_float'] = float(order.get('total_tax', 0))
-    
-    # Parse dates
-    if order.get('date_created'):
-        order['date_created_parsed'] = datetime.datetime.fromisoformat(
-            order['date_created'].replace('T', ' ').replace('Z', '')
-        )
-    
-    if order.get('date_completed'):
-        order['date_completed_parsed'] = datetime.datetime.fromisoformat(
-            order['date_completed'].replace('T', ' ').replace('Z', '')
-        )
-    
-    # Extract product information
-    order['product_count'] = len(order.get('line_items', []))
-    order['product_names'] = [item.get('name', '') for item in order.get('line_items', [])]
-    
-    return order
-
-def sync_order_to_supabase(order: Dict, wp_user_id: int):
-    """Sync WooCommerce order to Supabase"""
-    if not supabase:
-        return
-
-    try:
-        order_data = {
-            "wc_order_id": order['id'],
-            "wp_user_id": wp_user_id,
-            "wc_customer_id": order.get('customer_id'),
-            "status": order.get('status'),
-            "total": order['total_float'],
-            "subtotal": order['subtotal_float'],
-            "tax_total": order['tax_total_float'],
-            "currency": order.get('currency'),
-            "date_created": order.get('date_created'),
-            "date_completed": order.get('date_completed'),
-            "product_count": order['product_count'],
-            "product_names": order['product_names'],
-            "billing_email": order.get('billing', {}).get('email'),
-            "billing_phone": order.get('billing', {}).get('phone'),
-            "shipping_method": order.get('shipping_lines', [{}])[0].get('method_title') if order.get('shipping_lines') else None,
-            "payment_method": order.get('payment_method_title'),
-            "synced_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
-        }
-
-        # Check if order already exists
-        existing = supabase.table("wc_orders").select("wc_order_id").eq("wc_order_id", order['id']).execute()
-        
-        if existing.data:
-            # Update existing order
-            supabase.table("wc_orders").update(order_data).eq("wc_order_id", order['id']).execute()
-        else:
-            # Insert new order
-            supabase.table("wc_orders").insert(order_data).execute()
-
-    except Exception as e:
-        st.warning(f"Failed to sync order {order.get('id')} to Supabase: {e}")
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_wc_products() -> List[Dict]:
-    """Get WooCommerce products and sync to Supabase"""
-    if not wp_config:
-        return []
-
-    url = f"{wp_config['wp_url']}/wp-json/wc/v3/products"
-    params = {
-        "per_page": 100,
-        "status": "publish"
-    }
-
-    try:
-        resp = requests.get(
-            url,
-            auth=(wp_config['wc_key'], wp_config['wc_secret']),
-            params=params,
-            timeout=15
-        )
-
-        if resp.status_code == 200:
-            products = resp.json()
+        if wp_resp.status_code == 200:
+            wp_token_data = wp_resp.json()
             
-            # Sync products to Supabase
-            for product in products:
-                sync_product_to_supabase(product)
-            
-            return products
+            # Get WordPress user details
+            me_url = f"{wp_config['wp_url']}/wp-json/wp/v2/users/me"
+            me_resp = requests.get(
+                me_url,
+                headers={"Authorization": f"Bearer {wp_token_data['token']}"},
+                timeout=10
+            )
+
+            if me_resp.status_code == 200:
+                wp_user = me_resp.json()
+                user_email = wp_user.get('email', email)
+                
+                # Check WooCommerce product purchases
+                purchased_products = get_user_purchased_products(user_email)
+                
+                if not purchased_products:
+                    st.error("🛒 No product purchases found. Please purchase a product to access the application.")
+                    return None
+                
+                # Create user data with product information
+                user_data = {
+                    "wp_user_id": wp_user.get("id"),
+                    "email": user_email,
+                    "username": wp_user.get("username", wp_token_data.get("user_nicename")),
+                    "display_name": wp_user.get("name"),
+                    "wp_token": wp_token_data['token'],
+                    "purchased_products": purchased_products,
+                    "product_access": True,
+                    "roles": wp_user.get("roles", []),
+                    "capabilities": wp_user.get("capabilities", {})
+                }
+                
+                # Sync to Supabase with product info
+                sync_result = sync_woo_product_user(user_data)
+                if sync_result:
+                    return user_data
+                else:
+                    st.error("Failed to sync user data")
+                    return None
+            else:
+                st.error("Could not fetch WordPress user info")
+                return None
         else:
-            st.error(f"WooCommerce Products API error: {resp.status_code}")
-            return []
+            # If WordPress auth fails, try WooCommerce customer login
+            return woo_customer_login(email, password)
 
     except requests.exceptions.RequestException as e:
-        st.error(f"Failed to fetch WooCommerce products: {e}")
-        return []
+        st.error(f"Connection error: {e}")
+        return None
 
-def sync_product_to_supabase(product: Dict):
-    """Sync WooCommerce product to Supabase"""
-    if not supabase:
-        return
+def woo_customer_login(email: str, password: str) -> Optional[Dict]:
+    """Alternative login using WooCommerce customer data"""
+    if not wp_config:
+        return None
 
     try:
-        product_data = {
-            "wc_product_id": product['id'],
-            "name": product.get('name'),
-            "slug": product.get('slug'),
-            "status": product.get('status'),
-            "type": product.get('type'),
-            "description": product.get('description'),
-            "short_description": product.get('short_description'),
-            "sku": product.get('sku'),
-            "price": float(product.get('price', 0)),
-            "regular_price": float(product.get('regular_price', 0)),
-            "sale_price": float(product.get('sale_price', 0)) if product.get('sale_price') else None,
-            "stock_status": product.get('stock_status'),
-            "stock_quantity": product.get('stock_quantity'),
-            "categories": [cat.get('name') for cat in product.get('categories', [])],
-            "tags": [tag.get('name') for tag in product.get('tags', [])],
-            "images": [img.get('src') for img in product.get('images', [])],
-            "date_created": product.get('date_created'),
-            "date_modified": product.get('date_modified'),
-            "synced_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+        # Check if customer exists with purchases
+        purchased_products = get_user_purchased_products(email)
+        
+        if not purchased_products:
+            st.error("🛒 No product purchases found for this email. Please purchase a product to access the application.")
+            return None
+
+        # Get customer details
+        customers_url = f"{wp_config['wp_url']}/wp-json/wc/v3/customers"
+        customers_resp = requests.get(
+            customers_url,
+            auth=(wp_config['wc_key'], wp_config['wc_secret']),
+            params={"email": email, "per_page": 1},
+            timeout=10
+        )
+
+        if customers_resp.status_code == 200 and customers_resp.json():
+            customer = customers_resp.json()[0]
+            
+            # Create user data based on WooCommerce customer + products
+            user_data = {
+                "wc_customer_id": customer['id'],
+                "email": email,
+                "username": customer.get('username', email.split('@')[0]),
+                "display_name": f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip() or email,
+                "purchased_products": purchased_products,
+                "product_access": True,
+                "customer_data": customer
+            }
+            
+            # Sync to Supabase
+            sync_result = sync_woo_product_user(user_data)
+            if sync_result:
+                return user_data
+        
+        st.error("Customer authentication failed")
+        return None
+
+    except Exception as e:
+        st.error(f"WooCommerce customer login error: {e}")
+        return None
+
+def sync_woo_product_user(user_data: Dict) -> bool:
+    """Sync WooCommerce product user to Supabase"""
+    if not supabase:
+        return False
+
+    try:
+        # Prepare user data for Supabase
+        supabase_data = {
+            "wp_user_id": user_data.get("wp_user_id"),
+            "wc_customer_id": user_data.get("wc_customer_id"),
+            "email": user_data["email"],
+            "username": user_data["username"],
+            "display_name": user_data["display_name"],
+            "purchased_products": user_data["purchased_products"],
+            "product_access": user_data["product_access"],
+            "last_login": st.session_state.get('current_time', 'now()'),
+            "roles": user_data.get("roles", []),
+            "capabilities": user_data.get("capabilities", {}),
+            "wp_token": user_data.get("wp_token"),
+            "customer_data": user_data.get("customer_data")
         }
 
-        # Check if product already exists
-        existing = supabase.table("wc_products").select("wc_product_id").eq("wc_product_id", product['id']).execute()
+        # Check if user exists
+        identifier = user_data.get("wp_user_id") or user_data.get("wc_customer_id") or user_data["email"]
         
-        if existing.data:
-            # Update existing product
-            supabase.table("wc_products").update(product_data).eq("wc_product_id", product['id']).execute()
+        if user_data.get("wp_user_id"):
+            existing = supabase.table("wp_users").select("*").eq("wp_user_id", user_data["wp_user_id"]).execute()
+        elif user_data.get("wc_customer_id"):
+            existing = supabase.table("wp_users").select("*").eq("wc_customer_id", user_data["wc_customer_id"]).execute()
         else:
-            # Insert new product
-            supabase.table("wc_products").insert(product_data).execute()
+            existing = supabase.table("wp_users").select("*").eq("email", user_data["email"]).execute()
+
+        if existing.data:
+            # Update existing user
+            if user_data.get("wp_user_id"):
+                supabase.table("wp_users").update(supabase_data).eq("wp_user_id", user_data["wp_user_id"]).execute()
+            elif user_data.get("wc_customer_id"):
+                supabase.table("wp_users").update(supabase_data).eq("wc_customer_id", user_data["wc_customer_id"]).execute()
+            else:
+                supabase.table("wp_users").update(supabase_data).eq("email", user_data["email"]).execute()
+        else:
+            # Insert new user
+            supabase_data["created_at"] = st.session_state.get('current_time', 'now()')
+            supabase.table("wp_users").insert(supabase_data).execute()
+
+        # Initialize usage tracking
+        from utils.database import initialize_user_usage
+        user_id = user_data.get("wp_user_id") or user_data.get("wc_customer_id") or hash(user_data["email"])
+        initialize_user_usage(user_id, user_data["email"])
+
+        return True
 
     except Exception as e:
-        st.warning(f"Failed to sync product {product.get('id')} to Supabase: {e}")
+        st.error(f"Failed to sync WooCommerce product user: {e}")
+        return False
 
-def display_orders_analytics(orders: List[Dict]):
-    """Display comprehensive order analytics"""
-    if not orders:
-        st.info("📦 No orders found")
-        return
-        
-    # Convert to DataFrame for analysis
-    df = pd.DataFrame(orders)
-    df['month'] = pd.to_datetime(df['date_created']).dt.to_period('M')
+def get_user_product_access_level(email: str) -> Dict:
+    """Get user's product access level and permissions"""
+    purchased_products = get_user_purchased_products(email)
     
-    col1, col2, col3, col4 = st.columns(4)
+    if not purchased_products:
+        return {"access_level": "none", "products": [], "permissions": []}
     
-    with col1:
-        completed_orders = len([o for o in orders if o['status'] == 'completed'])
-        st.metric(
-            "Total Orders", 
-            len(orders),
-            delta=f"{completed_orders} completed"
-        )
+    # Define product-based access levels (customize as needed)
+    access_levels = {
+        "basic": {"min_products": 1, "permissions": ["property_search"]},
+        "premium": {"min_products": 3, "permissions": ["property_search", "analytics", "export"]},
+        "enterprise": {"min_products": 5, "permissions": ["property_search", "analytics", "export", "api_access"]}
+    }
     
-    with col2:
-        total_value = sum(o['total_float'] for o in orders)
-        st.metric("Total Value", f"${total_value:,.2f}")
+    product_count = len(purchased_products)
+    total_spent = sum(float(p.get('total', 0)) for p in purchased_products)
     
-    with col3:
-        avg_order = total_value / len(orders) if orders else 0
-        st.metric("Average Order", f"${avg_order:,.2f}")
+    # Determine access level
+    if product_count >= 5:
+        level = "enterprise"
+    elif product_count >= 3:
+        level = "premium"
+    elif product_count >= 1:
+        level = "basic"
+    else:
+        level = "none"
     
-    with col4:
-        recent_orders = len([o for o in orders if 
-            o.get('date_created_parsed') and 
-            o['date_created_parsed'] > datetime.datetime.now() - datetime.timedelta(days=30)
-        ])
-        st.metric("Recent Orders (30d)", recent_orders)
-    
-    # Order trend chart
-    if len(orders) > 1:
-        monthly_data = df.groupby('month').agg({
-            'id': 'count',
-            'total_float': 'sum'
-        }).reset_index()
-        monthly_data['month_str'] = monthly_data['month'].astype(str)
-        
-        fig = px.line(
-            monthly_data, 
-            x='month_str', 
-            y=['id', 'total_float'],
-            title="📈 Order Trends Over Time",
-            labels={'value': 'Count/Amount', 'month_str': 'Month'}
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    # Order status breakdown
-    status_counts = df['status'].value_counts()
-    if len(status_counts) > 1:
-        fig_status = px.pie(
-            values=status_counts.values,
-            names=status_counts.index,
-            title="📊 Order Status Distribution"
-        )
-        st.plotly_chart(fig_status, use_container_width=True)
-
-def get_user_orders_from_supabase(wp_user_id: int) -> List[Dict]:
-    """Get user orders from Supabase cache"""
-    if not supabase:
-        return []
-
-    try:
-        result = supabase.table("wc_orders").select("*").eq("wp_user_id", wp_user_id).order("date_created", desc=True).execute()
-        return result.data if result.data else []
-    except Exception as e:
-        st.warning(f"Failed to get orders from Supabase: {e}")
-        return []
-
+    return {
+        "access_level": level,
+        "products": purchased_products,
+        "product_count": product_count,
+        "total_spent": total_spent,
+        "permissions": access_levels.get(level, {}).get("permissions", [])
+    }
