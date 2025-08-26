@@ -1,0 +1,14 @@
+streamlit
+pandas
+numpy
+plotly
+matplotlib
+seaborn
+requests
+supabase
+python-wordpress-xmlrpc
+woocommerce
+PyJWT
+cryptography
+python-dateutil
+
